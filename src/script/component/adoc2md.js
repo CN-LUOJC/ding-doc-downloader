@@ -302,14 +302,112 @@ class CardFrame extends BlockFrame {
         super("","");
     }
 
+    getMarkdown(frame, areadyMD = "", workSpace) {
+        let tagOption = frame[1];
+        let metadata = tagOption.metadata || {};
+        let cardType = metadata.type || "";
+
+        // 调试：输出所有 card 节点的完整信息
+        console.log("[adoc2md调试] card节点, type:", cardType, "完整tagOption:", JSON.stringify(tagOption).substring(0, 1000));
+        console.log("[adoc2md调试] card子内容数量:", frame.length - 2);
+        for (let i = 2; i < frame.length; i++) {
+            if (Array.isArray(frame[i])) {
+                console.log("[adoc2md调试] card子节点", i, "tag:", frame[i][0], "option:", JSON.stringify(frame[i][1]).substring(0, 500));
+            } else {
+                console.log("[adoc2md调试] card子节点", i, "内容:", String(frame[i]).substring(0, 200));
+            }
+        }
+
+        // 判断是否是附件类型的 card
+        // 支持类型：application/x-alidocs-plugin-attachment, attachment, video, audio, file, pdf, document, image, media
+        let cardTypeLower = cardType.toLowerCase();
+        const isAttachment = cardTypeLower.includes("attachment") ||
+            cardTypeLower.includes("video") ||
+            cardTypeLower.includes("audio") ||
+            cardTypeLower.includes("file") ||
+            cardTypeLower.includes("pdf") ||
+            cardTypeLower.includes("document") ||
+            cardTypeLower.includes("image") ||
+            cardTypeLower.includes("media");
+
+        if (isAttachment) {
+            // 收集附件信息到 workSpace
+            const collectAttachment = workSpace.get("collectAttachment");
+            let attachmentInfo = {
+                type: cardType,
+                metadataId: metadata.id || "",
+                dentryUuid: metadata.dentryUuid || metadata.dentryId || "",
+                fileName: metadata.fileName || metadata.name || "",
+                fileSize: metadata.fileSize || 0,
+                downloadUrl: metadata.downloadUrl || metadata.url || "",
+                extension: metadata.extension || "",
+                contentType: metadata.contentType || "",
+            };
+
+            // 尝试从 card 子内容中提取更多附件信息
+            for (let i = 2; i < frame.length; i++) {
+                let item = frame[i];
+                if (Array.isArray(item) && item[1]) {
+                    let itemOption = item[1];
+                    if (itemOption.dentryUuid && !attachmentInfo.dentryUuid) {
+                        attachmentInfo.dentryUuid = itemOption.dentryUuid;
+                    }
+                    if (itemOption.fileName && !attachmentInfo.fileName) {
+                        attachmentInfo.fileName = itemOption.fileName;
+                    }
+                    if (itemOption.name && !attachmentInfo.fileName) {
+                        attachmentInfo.fileName = itemOption.name;
+                    }
+                    if (itemOption.fileSize && !attachmentInfo.fileSize) {
+                        attachmentInfo.fileSize = itemOption.fileSize;
+                    }
+                    if (itemOption.downloadUrl && !attachmentInfo.downloadUrl) {
+                        attachmentInfo.downloadUrl = itemOption.downloadUrl;
+                    }
+                    if (itemOption.url && !attachmentInfo.downloadUrl) {
+                        attachmentInfo.downloadUrl = itemOption.url;
+                    }
+                    if (itemOption.extension && !attachmentInfo.extension) {
+                        attachmentInfo.extension = itemOption.extension;
+                    }
+                    if (itemOption.contentType && !attachmentInfo.contentType) {
+                        attachmentInfo.contentType = itemOption.contentType;
+                    }
+                }
+            }
+
+            if (collectAttachment) {
+                collectAttachment(attachmentInfo);
+            }
+
+            // 在 markdown 中输出附件引用
+            let displayName = attachmentInfo.fileName || (cardType + "附件");
+            let attachDir = "attachments";
+            let localPath = attachDir + "/" + (attachmentInfo.fileName || (cardType + "_" + (attachmentInfo.dentryUuid || Date.now())));
+
+            let typeLabel = "";
+            switch (cardType) {
+                case "video": typeLabel = "视频"; break;
+                case "audio": typeLabel = "音频"; break;
+                case "pdf": typeLabel = "PDF"; break;
+                case "attachment": typeLabel = "附件"; break;
+                case "file": typeLabel = "文件"; break;
+                case "document": typeLabel = "文档"; break;
+                default: typeLabel = cardType;
+            }
+
+            return super.getBefore(frame[0], frame[1], areadyMD, workSpace) +
+                `📎 [${typeLabel}: ${displayName}](${localPath})` +
+                super.getAfter(frame[0], frame[1], areadyMD, workSpace);
+        }
+
+        // 其他不支持的 card 类型，保留原有逻辑
+        const getDocUrl = workSpace.get("getDdocUrl");
+        return [this.getBefore(frame[0], frame[1], areadyMD, workSpace), getDocUrl("类型:" + cardType), this.getAfter(frame[0], frame[1], areadyMD, workSpace)].join("");
+    }
 
     getBefore(tagName, tagOption, areadyMD = "", workSpace) {
         return super.getBefore(tagName, tagOption, areadyMD, workSpace) + "[不支持的内容，请到钉钉文档查看](";
-    }
-
-    getMarkdown(frame, areadyMD = "", workSpace) {
-        const getDocUrl = workSpace.get("getDdocUrl");
-        return [this.getBefore(frame[0], frame[1], areadyMD, workSpace), getDocUrl("类型:" + frame[1].metadata.type), this.getAfter(frame[0], frame[1], areadyMD, workSpace)].join("");
     }
 
     getAfter(tagName, tagOption, areadyMD, workSpace) {
@@ -483,15 +581,80 @@ function getCommentMark(lang) {
 
 
 /**
+ * 递归从数据对象中提取附件信息（adoc2md 内部使用）
+ * @param obj 数据对象
+ * @param attachInfo 附件信息对象（会被修改）
+ */
+function _deepExtractInfo(obj, attachInfo) {
+    if (!obj || typeof obj !== "object") return;
+
+    if (Array.isArray(obj)) {
+        for (let item of obj) {
+            _deepExtractInfo(item, attachInfo);
+        }
+        return;
+    }
+
+    if (obj.dentryUuid && !attachInfo.dentryUuid) attachInfo.dentryUuid = obj.dentryUuid;
+    if (obj.dentryId && !attachInfo.dentryUuid) attachInfo.dentryUuid = obj.dentryId;
+    if (obj.fileName && !attachInfo.fileName) attachInfo.fileName = obj.fileName;
+    if (obj.name && !attachInfo.fileName) attachInfo.fileName = obj.name;
+    if (obj.title && !attachInfo.fileName) attachInfo.fileName = obj.title;
+    if (obj.fileSize && !attachInfo.fileSize) attachInfo.fileSize = obj.fileSize;
+    if (obj.size && !attachInfo.fileSize) attachInfo.fileSize = obj.size;
+    if (obj.downloadUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.downloadUrl;
+    if (obj.url && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.url;
+    if (obj.src && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.src;
+    if (obj.extension && !attachInfo.extension) attachInfo.extension = obj.extension;
+    if (obj.fileExtension && !attachInfo.extension) attachInfo.extension = obj.fileExtension;
+    if (obj.contentType && !attachInfo.contentType) attachInfo.contentType = obj.contentType;
+    if (obj.mimeType && !attachInfo.contentType) attachInfo.contentType = obj.mimeType;
+    if (obj.fileType && !attachInfo.contentType) attachInfo.contentType = obj.fileType;
+    if (obj.ossUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.ossUrl;
+    if (obj.preSignUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.preSignUrl;
+    // 钉钉文档附件特有字段
+    if (obj.resourceId && !attachInfo.resourceId) attachInfo.resourceId = obj.resourceId;
+    if (obj.storagePath && !attachInfo.storagePath) attachInfo.storagePath = obj.storagePath;
+    if (obj.uniqueId && !attachInfo.uniqueId) attachInfo.uniqueId = obj.uniqueId;
+
+    // 从 fileType 推断扩展名
+    if (attachInfo.contentType && !attachInfo.extension) {
+        let extMap = {
+            "application/pdf": "pdf",
+            "video/mp4": "mp4",
+            "video/quicktime": "mov",
+            "audio/mpeg": "mp3",
+            "audio/wav": "wav",
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "application/zip": "zip",
+        };
+        if (extMap[attachInfo.contentType]) {
+            attachInfo.extension = extMap[attachInfo.contentType];
+        }
+    }
+
+    for (let key in obj) {
+        if (typeof obj[key] === "object" && obj[key] !== null) {
+            _deepExtractInfo(obj[key], attachInfo);
+        }
+    }
+}
+
+/**
  * 传入 钉钉文档的 docContent 字符串。
  * @param docContent {string}
  * @param docUrl {string} // 有些内容markdown不支持的，那么这时，在markdown中输出文档地址，使得用户可以在打开原文。
- * @return {[string, string[]]} // 数组第一个是markdown结果，第二个是警告列表。
+ * @param options {object?} // 可选配置
+ * @param options.dentryId {string?} // 文档的 dentryId，用于附件下载
+ * @return {[string, string[], object[]]} // 数组第一个是markdown结果，第二个是警告列表，第三个是附件信息列表。
  */
-function adoc2md(docContent, docUrl) {
+function adoc2md(docContent, docUrl, options) {
     if (typeof docContent === "string") {
         docContent = JSON.parse(docContent);
     }
+    options = options || {};
     let doc = Object.values(docContent.parts).find(p => p.type==="application/x-alidocs-word").data.body;
     let f = getFrame(doc[0]);
     if (!f) {
@@ -499,11 +662,105 @@ function adoc2md(docContent, docUrl) {
     }
     const w =  new WorkSpace();
     const warns = [];
+    const attachments = [];
     w.set("getDdocUrl", (reason) => {
         warns.push(`发现不支持的内容[${reason}]。`);
         return docUrl;
     });
-    return [f.getMarkdown(doc, "", w), warns];
+    w.set("collectAttachment", (attachmentInfo) => {
+        // 补充文档来源信息
+        attachmentInfo.sourceDentryId = options.dentryId || "";
+
+        // 如果 metadata 中有 id，尝试从 docContent.parts 中查找对应的 part 数据
+        if (attachmentInfo.metadataId && docContent.parts) {
+            let part = docContent.parts[attachmentInfo.metadataId];
+            if (part && part.data) {
+                console.log("[adoc2md调试] 通过metadataId找到part, type:", part.type);
+                _deepExtractInfo(part.data, attachmentInfo);
+            } else {
+                // 遍历所有 parts 查找匹配的
+                for (let partKey in docContent.parts) {
+                    let p = docContent.parts[partKey];
+                    if (p.type === attachmentInfo.type || p.id === attachmentInfo.metadataId) {
+                        console.log("[adoc2md调试] 通过遍历找到匹配part, key:", partKey);
+                        if (p.data) _deepExtractInfo(p.data, attachmentInfo);
+                        break;
+                    }
+                }
+            }
+        }
+
+        attachments.push(attachmentInfo);
+    });
+
+    // 同时扫描所有非 word 类型的 parts，提取附件信息
+    for (let partKey in docContent.parts) {
+        let part = docContent.parts[partKey];
+        if (part.type !== "application/x-alidocs-word") {
+            console.log("[adoc2md调试] 非word part, key:", partKey, "type:", part.type, "data:", JSON.stringify(part.data).substring(0, 2000));
+            let attachInfo = {
+                type: part.type || "",
+                partKey: partKey,
+                dentryUuid: "",
+                fileName: "",
+                fileSize: 0,
+                downloadUrl: "",
+                extension: "",
+                contentType: "",
+                sourceDentryId: options.dentryId || "",
+            };
+            if (part.data) {
+                _deepExtractInfo(part.data, attachInfo);
+            }
+            if (attachInfo.fileName || attachInfo.dentryUuid || attachInfo.downloadUrl) {
+                attachments.push(attachInfo);
+            }
+        }
+    }
+
+    // 同时扫描文档的 refs 部分，提取附件引用信息
+    let wordPart = Object.values(docContent.parts).find(p => p.type === "application/x-alidocs-word");
+    console.log("[adoc2md调试] docContent.parts keys:", Object.keys(docContent.parts));
+    console.log("[adoc2md调试] wordPart.refs:", wordPart && wordPart.refs ? JSON.stringify(wordPart.refs).substring(0, 2000) : "无refs");
+    if (wordPart && wordPart.data) {
+        console.log("[adoc2md调试] wordPart.data keys:", Object.keys(wordPart.data));
+    }
+    if (wordPart && wordPart.refs) {
+        let refs = wordPart.refs;
+        for (let refKey in refs) {
+            let ref = refs[refKey];
+            if (ref && ref.type && ref.type !== "application/x-alidocs-word") {
+                // 这是一个嵌入资源的引用
+                let attachInfo = {
+                    type: "ref",
+                    refKey: refKey,
+                    refType: ref.type || "",
+                    dentryUuid: ref.dentryUuid || ref.dentryId || "",
+                    fileName: ref.fileName || ref.name || "",
+                    fileSize: ref.fileSize || ref.size || 0,
+                    downloadUrl: ref.downloadUrl || ref.url || "",
+                    extension: ref.extension || "",
+                    contentType: ref.contentType || "",
+                    sourceDentryId: options.dentryId || "",
+                    data: ref.data || null,
+                };
+                attachments.push(attachInfo);
+            }
+        }
+    }
+
+    // 去重：根据 fileName + resourceId + downloadUrl 去重
+    const dedupedAttachments = [];
+    const seen = new Set();
+    for (let att of attachments) {
+        let key = (att.fileName || "") + "|" + (att.resourceId || "") + "|" + (att.downloadUrl || "") + "|" + (att.dentryUuid || "");
+        if (!seen.has(key)) {
+            seen.add(key);
+            dedupedAttachments.push(att);
+        }
+    }
+
+    return [f.getMarkdown(doc, "", w), warns, dedupedAttachments];
 }
 module.exports = {
     adoc2md,

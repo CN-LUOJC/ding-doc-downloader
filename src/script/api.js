@@ -351,12 +351,12 @@ async function downloadDingDoc2md(docKey, dentryKey, name, dentryId) {
 
     const {data: docData} = await getDocumentData(dentryKey, docKey);
 
-    let [markdownTxt, warns] = adoc2md(docData.documentContent.checkpoint.content, `https://alidocs.dingtalk.com/i/nodes/${dentryId}`);
+    let [markdownTxt, warns, attachments] = adoc2md(docData.documentContent.checkpoint.content, `https://alidocs.dingtalk.com/i/nodes/${dentryId}`, {dentryId: dentryId});
 
     markdownTxt = `# ${name}\n\n${markdownTxt}`;
 
     const blob = new Blob([markdownTxt], { type: "text/plain" });
-    return [URL.createObjectURL(blob), warns];
+    return [URL.createObjectURL(blob), warns, attachments];
 }
 
 async function downloadDingDoc2pdf(docKey,dentryKey,name) {
@@ -655,6 +655,311 @@ async function exportAsImg(asl, optionsString, scene = "", dentryKey, docKey) {
     return url;
 }
 
+/**
+ * 从钉钉文档内容中提取附件信息列表。
+ * 用于 docx/pdf 导出时也能获取到附件资源。
+ * @param dentryKey {string}
+ * @param docKey {string}
+ * @param dentryId {string}
+ * @return {Promise<object[]>}
+ */
+async function extractAttachments(dentryKey, docKey, dentryId) {
+    try {
+        const {data: docData} = await getDocumentData(dentryKey, docKey);
+        let docContent = JSON.parse(docData.documentContent.checkpoint.content);
+        let wordPart = Object.values(docContent.parts).find(p => p.type === "application/x-alidocs-word");
+        const attachments = [];
+
+        // 调试：输出完整的文档内容结构
+        console.log("[附件调试] docContent keys:", Object.keys(docContent));
+        console.log("[附件调试] parts types:", Object.values(docContent.parts).map(p => p.type));
+        console.log("[附件调试] wordPart refs:", JSON.stringify(wordPart && wordPart.refs ? wordPart.refs : "无refs"));
+        console.log("[附件调试] wordPart data keys:", wordPart && wordPart.data ? Object.keys(wordPart.data) : "无data");
+
+        // 调试：输出所有非 word 类型的 parts 的完整数据
+        for (let partKey in docContent.parts) {
+            let part = docContent.parts[partKey];
+            if (part.type !== "application/x-alidocs-word") {
+                console.log("[附件调试] 非word part, key:", partKey, "type:", part.type, "完整数据:", JSON.stringify(part).substring(0, 3000));
+            }
+        }
+
+        // 扫描所有非 word 类型的 parts，提取附件信息
+        for (let partKey in docContent.parts) {
+            let part = docContent.parts[partKey];
+            if (part.type === "application/x-alidocs-plugin-attachment") {
+                // 附件类型的 part
+                let attachInfo = _extractAttachmentFromPart(part, partKey, dentryId);
+                if (attachInfo) {
+                    attachments.push(attachInfo);
+                }
+            } else if (part.type !== "application/x-alidocs-word") {
+                // 其他非 word 类型（可能是视频、音频等）
+                let attachInfo = _extractAttachmentFromPart(part, partKey, dentryId);
+                if (attachInfo) {
+                    attachments.push(attachInfo);
+                }
+            }
+        }
+
+        if (wordPart && wordPart.refs) {
+            let refs = wordPart.refs;
+            for (let refKey in refs) {
+                let ref = refs[refKey];
+                console.log("[附件调试] ref key:", refKey, "ref内容:", JSON.stringify(ref));
+                if (ref && ref.type && ref.type !== "application/x-alidocs-word") {
+                    let attachInfo = {
+                        type: "ref",
+                        refKey: refKey,
+                        refType: ref.type || "",
+                        dentryUuid: ref.dentryUuid || ref.dentryId || "",
+                        fileName: ref.fileName || ref.name || "",
+                        fileSize: ref.fileSize || ref.size || 0,
+                        downloadUrl: ref.downloadUrl || ref.url || "",
+                        extension: ref.extension || "",
+                        contentType: ref.contentType || "",
+                        sourceDentryId: dentryId || "",
+                        data: ref.data || null,
+                    };
+                    attachments.push(attachInfo);
+                }
+            }
+        }
+
+        // 扫描文档 body 中的 card 节点提取附件信息，并关联 parts 中的数据
+        if (wordPart && wordPart.data && wordPart.data.body) {
+            let body = wordPart.data.body;
+            _collectCardAttachments(body, attachments, dentryId, docContent.parts);
+        }
+
+        console.log("[附件调试] 最终提取到的附件数量:", attachments.length, "附件列表:", JSON.stringify(attachments));
+
+        // 去重：根据 fileName + resourceId + downloadUrl 去重
+        const dedupedAttachments = [];
+        const seen = new Set();
+        for (let att of attachments) {
+            let key = (att.fileName || "") + "|" + (att.resourceId || "") + "|" + (att.downloadUrl || "") + "|" + (att.dentryUuid || "");
+            if (!seen.has(key)) {
+                seen.add(key);
+                dedupedAttachments.push(att);
+            }
+        }
+
+        console.log("[附件调试] 去重后附件数量:", dedupedAttachments.length);
+        return dedupedAttachments;
+    } catch (e) {
+        console.log("提取附件信息失败: " + e.message);
+        return [];
+    }
+}
+
+/**
+ * 从 part 中提取附件下载信息
+ * @param part {object} docContent.parts 中的一个 part
+ * @param partKey {string} part 的 key
+ * @param dentryId {string}
+ * @return {object|null}
+ */
+function _extractAttachmentFromPart(part, partKey, dentryId) {
+    if (!part || !part.data) {
+        console.log("[附件调试] part无data, key:", partKey);
+        return null;
+    }
+
+    let data = part.data;
+    console.log("[附件调试] 尝试从part提取附件, key:", partKey, "type:", part.type, "data keys:", Object.keys(data));
+
+    // 附件数据可能在 data 的不同字段中
+    let attachInfo = {
+        type: part.type || "",
+        partKey: partKey,
+        dentryUuid: "",
+        fileName: "",
+        fileSize: 0,
+        downloadUrl: "",
+        extension: "",
+        contentType: "",
+        sourceDentryId: dentryId || "",
+    };
+
+    // 遍历 data 的所有字段，查找附件相关信息
+    // 钉钉文档的附件数据结构可能嵌套在不同位置
+    _deepExtractAttachmentInfo(data, attachInfo);
+
+    console.log("[附件调试] 从part提取结果:", JSON.stringify(attachInfo));
+    return attachInfo;
+}
+
+/**
+ * 递归从数据对象中提取附件信息
+ * @param obj 数据对象
+ * @param attachInfo 附件信息对象（会被修改）
+ */
+function _deepExtractAttachmentInfo(obj, attachInfo) {
+    if (!obj || typeof obj !== "object") return;
+
+    if (Array.isArray(obj)) {
+        for (let item of obj) {
+            _deepExtractAttachmentInfo(item, attachInfo);
+        }
+        return;
+    }
+
+    // 检查常见字段名
+    if (obj.dentryUuid && !attachInfo.dentryUuid) attachInfo.dentryUuid = obj.dentryUuid;
+    if (obj.dentryId && !attachInfo.dentryUuid) attachInfo.dentryUuid = obj.dentryId;
+    if (obj.fileName && !attachInfo.fileName) attachInfo.fileName = obj.fileName;
+    if (obj.name && !attachInfo.fileName) attachInfo.fileName = obj.name;
+    if (obj.title && !attachInfo.fileName) attachInfo.fileName = obj.title;
+    if (obj.fileSize && !attachInfo.fileSize) attachInfo.fileSize = obj.fileSize;
+    if (obj.size && !attachInfo.fileSize) attachInfo.fileSize = obj.size;
+    if (obj.downloadUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.downloadUrl;
+    if (obj.url && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.url;
+    if (obj.src && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.src;
+    if (obj.extension && !attachInfo.extension) attachInfo.extension = obj.extension;
+    if (obj.fileExtension && !attachInfo.extension) attachInfo.extension = obj.fileExtension;
+    if (obj.contentType && !attachInfo.contentType) attachInfo.contentType = obj.contentType;
+    if (obj.mimeType && !attachInfo.contentType) attachInfo.contentType = obj.mimeType;
+    if (obj.fileType && !attachInfo.contentType) attachInfo.contentType = obj.fileType;
+    if (obj.ossUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.ossUrl;
+    if (obj.preSignUrl && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.preSignUrl;
+    if (obj.downloadCode && !attachInfo.downloadUrl) attachInfo.downloadUrl = obj.downloadCode;
+    // 钉钉文档附件特有字段
+    if (obj.resourceId && !attachInfo.resourceId) attachInfo.resourceId = obj.resourceId;
+    if (obj.storagePath && !attachInfo.storagePath) attachInfo.storagePath = obj.storagePath;
+    if (obj.uniqueId && !attachInfo.uniqueId) attachInfo.uniqueId = obj.uniqueId;
+
+    // 从 fileType 推断扩展名
+    if (attachInfo.contentType && !attachInfo.extension) {
+        let extMap = {
+            "application/pdf": "pdf",
+            "video/mp4": "mp4",
+            "video/quicktime": "mov",
+            "video/x-msvideo": "avi",
+            "audio/mpeg": "mp3",
+            "audio/wav": "wav",
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "application/zip": "zip",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+            "application/msword": "doc",
+            "application/vnd.ms-excel": "xls",
+            "application/vnd.ms-powerpoint": "ppt",
+        };
+        if (extMap[attachInfo.contentType]) {
+            attachInfo.extension = extMap[attachInfo.contentType];
+        }
+    }
+
+    // 继续递归（但限制深度避免无限循环）
+    for (let key in obj) {
+        if (typeof obj[key] === "object" && obj[key] !== null) {
+            _deepExtractAttachmentInfo(obj[key], attachInfo);
+        }
+    }
+}
+
+/**
+ * 递归扫描文档 body 中的 card 节点，提取附件信息
+ * @param frame 文档节点
+ * @param attachments {object[]} 附件收集列表
+ * @param dentryId {string}
+ */
+function _collectCardAttachments(frame, attachments, dentryId, docContentParts) {
+    if (!Array.isArray(frame)) return;
+
+    let tagName = frame[0];
+    let tagOption = frame[1];
+
+    if (tagName === "card") {
+        console.log("[附件调试] 发现card节点, tagOption:", JSON.stringify(tagOption));
+    }
+
+    if (tagName === "card" && tagOption) {
+        let metadata = tagOption.metadata || {};
+        let cardType = metadata.type || "";
+        let cardTypeLower = cardType.toLowerCase();
+        console.log("[附件调试] card metadata:", JSON.stringify(metadata));
+
+        // 判断是否是附件类型的 card
+        // 支持类型：application/x-alidocs-plugin-attachment, attachment, video, audio, file, pdf, document
+        const isAttachment = cardTypeLower.includes("attachment") ||
+            cardTypeLower.includes("video") ||
+            cardTypeLower.includes("audio") ||
+            cardTypeLower.includes("file") ||
+            cardTypeLower.includes("pdf") ||
+            cardTypeLower.includes("document") ||
+            cardTypeLower.includes("image") ||
+            cardTypeLower.includes("media");
+
+        if (isAttachment) {
+            let attachmentInfo = {
+                type: cardType,
+                dentryUuid: metadata.dentryUuid || metadata.dentryId || "",
+                fileName: metadata.fileName || metadata.name || "",
+                fileSize: metadata.fileSize || 0,
+                downloadUrl: metadata.downloadUrl || metadata.url || "",
+                extension: metadata.extension || "",
+                contentType: metadata.contentType || "",
+                sourceDentryId: dentryId || "",
+            };
+
+            // 如果 metadata 中有 id，尝试从 docContentParts 中查找对应的 part 数据
+            if (metadata.id && docContentParts) {
+                let part = docContentParts[metadata.id];
+                if (part) {
+                    console.log("[附件调试] 通过metadata.id找到part, type:", part.type, "data:", JSON.stringify(part.data).substring(0, 2000));
+                    _deepExtractAttachmentInfo(part.data, attachmentInfo);
+                } else {
+                    // 尝试遍历所有 parts 查找匹配的
+                    for (let partKey in docContentParts) {
+                        let p = docContentParts[partKey];
+                        if (p.type === cardType || p.id === metadata.id) {
+                            console.log("[附件调试] 通过遍历找到匹配part, key:", partKey);
+                            _deepExtractAttachmentInfo(p.data, attachmentInfo);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 从 card 子内容中提取更多附件信息
+            for (let i = 2; i < frame.length; i++) {
+                let item = frame[i];
+                if (Array.isArray(item) && item[1]) {
+                    let itemOption = item[1];
+                    if (itemOption.dentryUuid && !attachmentInfo.dentryUuid) attachmentInfo.dentryUuid = itemOption.dentryUuid;
+                    if (itemOption.fileName && !attachmentInfo.fileName) attachmentInfo.fileName = itemOption.fileName;
+                    if (itemOption.name && !attachmentInfo.fileName) attachmentInfo.fileName = itemOption.name;
+                    if (itemOption.fileSize && !attachmentInfo.fileSize) attachmentInfo.fileSize = itemOption.fileSize;
+                    if (itemOption.downloadUrl && !attachmentInfo.downloadUrl) attachmentInfo.downloadUrl = itemOption.downloadUrl;
+                    if (itemOption.url && !attachmentInfo.downloadUrl) attachmentInfo.downloadUrl = itemOption.url;
+                    if (itemOption.extension && !attachmentInfo.extension) attachmentInfo.extension = itemOption.extension;
+                    if (itemOption.contentType && !attachmentInfo.contentType) attachmentInfo.contentType = itemOption.contentType;
+                }
+            }
+
+            console.log("[附件调试] card附件提取结果:", JSON.stringify(attachmentInfo));
+            attachments.push(attachmentInfo);
+        }
+    }
+
+    // 递归处理子节点
+    for (let i = 2; i < frame.length; i++) {
+        if (Array.isArray(frame[i])) {
+            // 调试：输出所有非标准节点
+            let childTag = frame[i][0];
+            if (childTag !== "p" && childTag !== "span" && childTag !== "h1" && childTag !== "h2" && childTag !== "h3" && childTag !== "h4" && childTag !== "h5" && childTag !== "root" && childTag !== "table" && childTag !== "tr" && childTag !== "tc" && childTag !== "code" && childTag !== "br" && childTag !== "hr" && childTag !== "a" && childTag !== "img" && childTag !== "container") {
+                console.log("[附件调试] 非标准节点类型:", childTag, "内容:", JSON.stringify(frame[i]).substring(0, 500));
+            }
+            _collectCardAttachments(frame[i], attachments, dentryId, docContentParts);
+        }
+    }
+}
+
 module.exports = {
     /**
      * 获取文档信息
@@ -730,6 +1035,86 @@ module.exports = {
     },
 
     /**
+     * 下载钉钉文档内嵌的附件资源。
+     * 返回值可能是：1) 预签名下载URL字符串 2) {blob, fileName} 对象（直接拿到文件内容）
+     * @param attachmentInfo {object} 附件信息对象
+     * @param attachmentInfo.resourceId {string} 附件的 resourceId
+     * @param attachmentInfo.dentryUuid {string} 附件的 dentryUuid
+     * @param attachmentInfo.downloadUrl {string} 附件的 src/downloadUrl
+     * @param attachmentInfo.fileName {string} 附件文件名
+     * @param attachmentInfo.type {string} 附件类型
+     * @param dentryKey {string} 所属文档的 dentryKey
+     * @param docKey {string} 所属文档的 docKey
+     * @return {Promise<string|object|null>}
+     */
+    async downloadAttachment(attachmentInfo, dentryKey, docKey) {
+        console.log("[附件下载] 开始下载附件:", JSON.stringify(attachmentInfo).substring(0, 500));
+
+        // 方式1：通过 resourceId 调用 /core/api/resources/{resourceId}/detail
+        // 这个 API 直接返回文件二进制内容
+        if (attachmentInfo.resourceId) {
+            try {
+                console.log("[附件下载] 尝试通过 resourceId 获取文件内容:", attachmentInfo.resourceId);
+                const blob = await httpRequest({
+                    url: getBase() + "/core/api/resources/" + attachmentInfo.resourceId + "/detail",
+                    method: "GET",
+                    headers: {
+                        "A-Token": accessToken.value,
+                        "corp-id": corpId.value,
+                        "a-dentry-key": dentryKey || "",
+                        "a-doc-key": docKey || "",
+                    },
+                    originResponse: true,
+                });
+                console.log("[附件下载] 通过 resourceId 获取文件内容成功, blob size:", blob.size, "type:", blob.type);
+                return {blob: blob, fileName: attachmentInfo.fileName || ""};
+            } catch (e) {
+                console.log("[附件下载] 通过 resourceId 获取文件内容失败: " + e.message);
+            }
+        }
+
+        // 方式2：通过 src 路径获取文件内容（同样是直接返回二进制）
+        if (attachmentInfo.downloadUrl && attachmentInfo.downloadUrl.startsWith("/core/api/resources/")) {
+            try {
+                console.log("[附件下载] 尝试通过 src 路径获取文件内容:", attachmentInfo.downloadUrl);
+                const blob = await httpRequest({
+                    url: getBase() + attachmentInfo.downloadUrl,
+                    method: "GET",
+                    headers: {
+                        "A-Token": accessToken.value,
+                        "corp-id": corpId.value,
+                        "a-dentry-key": dentryKey || "",
+                        "a-doc-key": docKey || "",
+                    },
+                    originResponse: true,
+                });
+                console.log("[附件下载] 通过 src 路径获取文件内容成功, blob size:", blob.size);
+                return {blob: blob, fileName: attachmentInfo.fileName || ""};
+            } catch (e) {
+                console.log("[附件下载] 通过 src 路径获取文件内容失败: " + e.message);
+            }
+        }
+
+        // 方式3：通过 dentryUuid 获取预签名下载链接
+        if (attachmentInfo.dentryUuid) {
+            try {
+                console.log("[附件下载] 尝试通过 dentryUuid 下载:", attachmentInfo.dentryUuid);
+                return await module.exports.downloadDocument(attachmentInfo.dentryUuid);
+            } catch (e) {
+                console.log("[附件下载] 通过 dentryUuid 下载失败: " + e.message);
+            }
+        }
+
+        // 方式4：直接使用 downloadUrl（如果是完整的 https URL）
+        if (attachmentInfo.downloadUrl && attachmentInfo.downloadUrl.startsWith("http")) {
+            return attachmentInfo.downloadUrl;
+        }
+
+        console.log("[附件下载] 所有下载方式均失败");
+        return null;
+    },
+
+    /**
      * 下载 axls 文件
      * @param dentryUuid
      * @return {Promise<string>} 返回文件下载链接
@@ -748,13 +1133,25 @@ module.exports = {
      * @param name
      * @param size
      * @param downloadFileType {".md"|".pdf"|".docx"} 下载后缀，adoc 类型的文件，支持下载为：.md, .pdf 和 .docx
-     * @return {Promise<string>}
+     * @return {Promise<string|[string, string[], object[]]>}
      */
     async downloadAdoc(dentryUuid, docKey,dentryKey,contentType, name, size, downloadFileType) {
         if (downloadFileType === ".docx") {
-            return downloadDingDoc(dentryUuid, docKey, dentryKey, contentType, name, size, "dingTalkdocTodocx");
+            let url = await downloadDingDoc(dentryUuid, docKey, dentryKey, contentType, name, size, "dingTalkdocTodocx");
+            // docx 格式也需要提取附件信息
+            let attachments = await extractAttachments(dentryKey, docKey, dentryUuid);
+            if (attachments.length > 0) {
+                return [url, [], attachments];
+            }
+            return url;
         } else if (downloadFileType === ".pdf") {
-            return downloadDingDoc2pdf(docKey, dentryKey, name);
+            let url = await downloadDingDoc2pdf(docKey, dentryKey, name);
+            // pdf 格式也需要提取附件信息
+            let attachments = await extractAttachments(dentryKey, docKey, dentryUuid);
+            if (attachments.length > 0) {
+                return [url, [], attachments];
+            }
+            return url;
         } else if (downloadFileType === ".md") {
             return downloadDingDoc2md(docKey, dentryKey, name, dentryUuid);
         } else {

@@ -167,7 +167,7 @@ module.exports = {
 
             dalert(`已导出勾选的 - 但请您注意 - 钉钉文档下载器 v${version}`, this.$createElement(h => {
                 return h("div", {}, [
-                    h("div", {class: "mb-4 bg-amber-400 text-sm p-4 rounded-md"}, "由于Markdown内容支持单一，钉钉文档部分内容无法在 Markdown 中呈现。对于不支持的部分，在导出的md文件中会保留文档的打开链接，您可以打开链接查看钉钉文档原文。建议钉钉文档(.adoc)导出为 .docx 或 .pdf"),
+                    h("div", {class: "mb-4 bg-amber-400 text-sm p-4 rounded-md"}, "由于Markdown内容支持单一，钉钉文档部分内容无法在 Markdown 中呈现。对于不支持的部分，在导出的md文件中会保留文档的打开链接，您可以打开链接查看钉钉文档原文。建议钉钉文档(.adoc)导出为 .docx 或 .pdf。文档中的附件资源已下载到同名 _attachments 目录中。"),
                     h("ul", {}, warnMap.map(warn => {
                         return h("li", {}, [
                             h("span", {}, [
